@@ -1,2 +1,0 @@
-# SCORM
-Conversor para SCORM
