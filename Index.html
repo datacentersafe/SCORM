@@ -2994,7 +2994,7 @@ function parseSlideShapes(xml, relMap) {
       const tag = node.tagName;
 
       if (tag === 'p:sp') {
-        const el = parseShape(node);
+        const el = parseShape(node, relMap);
         if (el) elements.push(el);
       } else if (tag === 'p:pic') {
         const el = parsePicture(node, relMap);
@@ -3038,7 +3038,7 @@ function getXfrmGeom(xfrm) {
   };
 }
 
-function parseShape(spNode) {
+function parseShape(spNode, relMap) {
   const xfrm = getXfrm(spNode);
   const geom = getXfrmGeom(xfrm);
   if (!geom) return null;
@@ -3072,7 +3072,34 @@ function parseShape(spNode) {
   }
 
   // Texto dentro do shape
-  const texts = parseTextBody(spNode);
+  const texts = parseTextBody(spNode, relMap);
+
+  // Detectar hyperlink (incluindo YouTube) no shape inteiro
+  // Mas antes, se algum run de texto já tem link YouTube, esse texto é o link.
+  // Vou pegar o primeiro hlink encontrado em qualquer lugar do shape.
+  let hlink = findHyperlink(spNode, relMap);
+  if (!hlink && texts.length) {
+    // Procurar nos runs de texto
+    for (const para of texts) {
+      for (const run of para.runs) {
+        if (run.hyperlink) { hlink = run.hyperlink; break; }
+      }
+      if (hlink) break;
+    }
+  }
+
+  if (hlink) {
+    const ytId = extractYouTubeId(hlink);
+    if (ytId) {
+      // Shape com link de YouTube vira um player de vídeo
+      return {
+        kind: 'youtube',
+        videoId: ytId,
+        url: hlink,
+        geom: geom
+      };
+    }
+  }
 
   return {
     kind: 'shape',
@@ -3081,7 +3108,8 @@ function parseShape(spNode) {
     fillColor: fillColor,
     strokeColor: strokeColor,
     strokeWidth: strokeWidth,
-    texts: texts
+    texts: texts,
+    hyperlink: hlink || null
   };
 }
 
@@ -3099,11 +3127,81 @@ function parsePicture(picNode, relMap) {
   const rel = relMap[embed];
   const fileName = rel.fileName;
 
+  // Detectar se a imagem é o thumbnail de um vídeo do YouTube
+  // (PowerPoint cria um <p:pic> com hyperlink ou <p:videoFile> apontando para a URL)
+  const hlink = findHyperlink(picNode, relMap);
+  if (hlink) {
+    const ytId = extractYouTubeId(hlink);
+    if (ytId) {
+      return {
+        kind: 'youtube',
+        videoId: ytId,
+        url: hlink,
+        geom: geom,
+        thumbnail: fileName  // thumbnail vem do PPTX
+      };
+    }
+  }
+
+  // Detectar <p:videoFile r:link="rId#"> (vídeo online do PowerPoint)
+  const videoFile = picNode.getElementsByTagName('p:videoFile')[0];
+  if (videoFile) {
+    const linkId = videoFile.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'link')
+                || videoFile.getAttribute('r:link');
+    if (linkId && relMap[linkId]) {
+      const target = relMap[linkId].target;
+      const ytId = extractYouTubeId(target);
+      if (ytId) {
+        return {
+          kind: 'youtube',
+          videoId: ytId,
+          url: target,
+          geom: geom,
+          thumbnail: fileName
+        };
+      }
+    }
+  }
+
   return {
     kind: 'pic',
     geom: geom,
-    src: fileName
+    src: fileName,
+    hyperlink: hlink || null
   };
+}
+
+// Encontra URL de hyperlink em um shape/picture
+// Procura: <a:hlinkClick r:id="..."/> em spPr/blip/cNvPicPr/etc
+function findHyperlink(node, relMap) {
+  const hlinks = node.getElementsByTagName('a:hlinkClick');
+  for (let i = 0; i < hlinks.length; i++) {
+    const rid = hlinks[i].getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id')
+             || hlinks[i].getAttribute('r:id');
+    if (rid && relMap[rid]) {
+      return relMap[rid].target;
+    }
+  }
+  return null;
+}
+
+// Extrai ID do YouTube de várias formas de URL
+// Suporta: youtu.be/ID, youtube.com/watch?v=ID, youtube.com/embed/ID, youtube.com/shorts/ID
+function extractYouTubeId(url) {
+  if (!url) return null;
+  const patterns = [
+    /youtube\.com\/watch\?(?:[^&]*&)*v=([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/v\/([a-zA-Z0-9_-]{11})/,
+    /youtube\.com\/shorts\/([a-zA-Z0-9_-]{11})/,
+    /youtu\.be\/([a-zA-Z0-9_-]{11})/,
+    /youtube-nocookie\.com\/embed\/([a-zA-Z0-9_-]{11})/
+  ];
+  for (let p of patterns) {
+    const m = url.match(p);
+    if (m) return m[1];
+  }
+  return null;
 }
 
 function directChild(parent, tagName) {
@@ -3133,11 +3231,10 @@ function parseColor(fillNode) {
   return null;
 }
 
-function parseTextBody(spNode) {
+function parseTextBody(spNode, relMap) {
   const txBody = spNode.getElementsByTagName('p:txBody')[0];
   if (!txBody) return [];
   const paragraphs = [];
-  // Iterar <a:p> dentro de p:txBody
   for (let i = 0; i < txBody.childNodes.length; i++) {
     const p = txBody.childNodes[i];
     if (p.nodeType !== 1 || p.tagName !== 'a:p') continue;
@@ -3148,7 +3245,7 @@ function parseTextBody(spNode) {
       const r = p.childNodes[j];
       if (r.nodeType !== 1) continue;
       if (r.tagName === 'a:r') {
-        const run = parseTextRun(r);
+        const run = parseTextRun(r, relMap);
         if (run) runs.push(run);
       } else if (r.tagName === 'a:br') {
         runs.push({ text: '\n', bold: false, italic: false, size: null, color: null });
@@ -3159,24 +3256,32 @@ function parseTextBody(spNode) {
   return paragraphs;
 }
 
-function parseTextRun(rNode) {
+function parseTextRun(rNode, relMap) {
   const t = rNode.getElementsByTagName('a:t')[0];
   if (!t) return null;
   const text = t.textContent;
   const rPr = rNode.getElementsByTagName('a:rPr')[0];
-  let bold = false, italic = false, size = null, color = null, font = null, underline = false;
+  let bold = false, italic = false, size = null, color = null, font = null, underline = false, hyperlink = null;
   if (rPr) {
     bold = rPr.getAttribute('b') === '1';
     italic = rPr.getAttribute('i') === '1';
     underline = (rPr.getAttribute('u') || 'none') !== 'none';
     const sz = rPr.getAttribute('sz');
-    if (sz) size = parseInt(sz) / 100;  // centipontos -> pt
+    if (sz) size = parseInt(sz) / 100;
     const fill = directChild(rPr, 'a:solidFill');
     if (fill) color = parseColor(fill);
     const latin = rPr.getElementsByTagName('a:latin')[0];
     if (latin) font = latin.getAttribute('typeface');
+
+    // Hyperlink no run (texto clicável)
+    const hlink = directChild(rPr, 'a:hlinkClick');
+    if (hlink && relMap) {
+      const rid = hlink.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id')
+               || hlink.getAttribute('r:id');
+      if (rid && relMap[rid]) hyperlink = relMap[rid].target;
+    }
   }
-  return { text, bold, italic, underline, size, color, font };
+  return { text, bold, italic, underline, size, color, font, hyperlink };
 }
 
 // ====== TEMPLATES =====
@@ -3423,6 +3528,115 @@ html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Sego
 .ppt-text span {
   display: inline;
 }
+.ppt-text .ppt-link {
+  pointer-events: auto;
+  cursor: pointer;
+  color: inherit;
+  text-decoration: underline;
+  transition: opacity 0.15s;
+}
+.ppt-text .ppt-link-yt {
+  color: #cc0000;
+  font-weight: 600;
+}
+.ppt-text .ppt-link:hover {
+  opacity: 0.75;
+}
+
+/* === YouTube embed === */
+.ppt-youtube {
+  background: #000;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.ppt-youtube iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+.ppt-yt-expand {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(0,0,0,0.65);
+  color: white;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+  opacity: 0;
+  transition: opacity 0.2s, background 0.2s;
+  backdrop-filter: blur(8px);
+}
+.ppt-youtube:hover .ppt-yt-expand { opacity: 1; }
+.ppt-yt-expand:hover { background: rgba(0,0,0,0.9); }
+@media (hover: none) { .ppt-yt-expand { opacity: 0.85; } }
+
+.ppt-video-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  animation: ppt-fade-in 0.2s ease-out;
+}
+@keyframes ppt-fade-in { from { opacity: 0; } to { opacity: 1; } }
+.ppt-video-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.92);
+  backdrop-filter: blur(8px);
+}
+.ppt-video-content {
+  position: relative;
+  width: min(92vw, 1280px);
+  z-index: 1;
+}
+.ppt-video-frame {
+  position: relative;
+  width: 100%;
+  padding-bottom: 56.25%;  /* 16:9 */
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 24px 80px rgba(0,0,0,0.8);
+}
+.ppt-video-frame iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+.ppt-video-close {
+  position: absolute;
+  top: -48px;
+  right: 0;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.1);
+  color: white;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.ppt-video-close:hover { background: rgba(255,255,255,0.25); }
+
+@media (max-width: 600px) {
+  .ppt-video-content { width: 96vw; }
+  .ppt-video-close { top: auto; bottom: -48px; right: 50%; transform: translateX(50%); }
+}
 
 .swipe-hint { display: none; text-align: center; font-size: 11px; color: var(--muted); padding: 8px; opacity: 0.6; }
 @media (hover: none) and (pointer: coarse) { .swipe-hint { display: block; } }
@@ -3599,6 +3813,23 @@ function renderElement(el) {
            '</div>';
   }
 
+  if (el.kind === 'youtube') {
+    // Iframe responsivo do YouTube com botão de fullscreen
+    var ytSrc = 'https://www.youtube.com/embed/' + encodeURIComponent(el.videoId) + '?rel=0&modestbranding=1';
+    return '<div class="ppt-el ppt-youtube" style="' + style + '">' +
+           '<iframe src="' + ytSrc + '" ' +
+             'frameborder="0" ' +
+             'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" ' +
+             'allowfullscreen="allowfullscreen" ' +
+             'loading="lazy"></iframe>' +
+           '<button class="ppt-yt-expand" onclick="expandVideo(\\''+ el.videoId +'\\')" title="Expandir vídeo">' +
+             '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5">' +
+               '<path d="M3 7V3h4M21 7V3h-4M3 17v4h4M21 17v4h-4"/>' +
+             '</svg>' +
+           '</button>' +
+           '</div>';
+  }
+
   if (el.kind === 'shape') {
     return renderShape(el, style);
   }
@@ -3677,12 +3908,45 @@ function renderTextBody(paragraphs) {
       if (run.color) styleParts.push('color:' + run.color);
       if (run.font) styleParts.push('font-family:"' + run.font + '",inherit');
       var style = styleParts.length ? ' style="' + styleParts.join(';') + '"' : '';
-      html += '<span' + style + '>' + escapeHTML(run.text) + '</span>';
+
+      // Se o run tem hyperlink, transformar em link clicável
+      if (run.hyperlink) {
+        var ytId = matchYouTubeId(run.hyperlink);
+        if (ytId) {
+          // Link de YouTube: abre modal de vídeo
+          html += '<a href="javascript:void(0)" onclick="expandVideo(\\'' + ytId + '\\')"' +
+                  ' class="ppt-link ppt-link-yt"' + style + '>' + escapeHTML(run.text) + '</a>';
+        } else {
+          // Link genérico: abre em nova aba
+          html += '<a href="' + escapeAttr(run.hyperlink) + '" target="_blank" rel="noopener"' +
+                  ' class="ppt-link"' + style + '>' + escapeHTML(run.text) + '</a>';
+        }
+      } else {
+        html += '<span' + style + '>' + escapeHTML(run.text) + '</span>';
+      }
     });
     html += '</p>';
   });
   html += '</div>';
   return html;
+}
+
+// Versão runtime do extractor de YouTube ID (mesma lógica usada na conversão)
+function matchYouTubeId(url) {
+  if (!url) return null;
+  var patterns = [
+    /youtube\\.com\\/watch\\?(?:[^&]*&)*v=([a-zA-Z0-9_-]{11})/,
+    /youtube\\.com\\/embed\\/([a-zA-Z0-9_-]{11})/,
+    /youtube\\.com\\/v\\/([a-zA-Z0-9_-]{11})/,
+    /youtube\\.com\\/shorts\\/([a-zA-Z0-9_-]{11})/,
+    /youtu\\.be\\/([a-zA-Z0-9_-]{11})/,
+    /youtube-nocookie\\.com\\/embed\\/([a-zA-Z0-9_-]{11})/
+  ];
+  for (var i = 0; i < patterns.length; i++) {
+    var m = url.match(patterns[i]);
+    if (m) return m[1];
+  }
+  return null;
 }
 
 // Faz o slide caber no espaço disponível mantendo proporção
@@ -3699,6 +3963,46 @@ function scaleSlide() {
 }
 
 window.addEventListener('resize', function() { scaleSlide(); });
+
+// =============================================================
+// MODAL DE VÍDEO FULLSCREEN (YouTube e outros)
+// =============================================================
+window.expandVideo = function(videoId) {
+  var existing = document.getElementById('ppt-video-modal');
+  if (existing) existing.remove();
+  var modal = document.createElement('div');
+  modal.id = 'ppt-video-modal';
+  modal.className = 'ppt-video-modal';
+  modal.innerHTML =
+    '<div class="ppt-video-backdrop" onclick="closeVideoModal()"></div>' +
+    '<div class="ppt-video-content">' +
+      '<button class="ppt-video-close" onclick="closeVideoModal()" title="Fechar (ESC)">' +
+        '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5">' +
+          '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>' +
+        '</svg>' +
+      '</button>' +
+      '<div class="ppt-video-frame">' +
+        '<iframe src="https://www.youtube.com/embed/' + encodeURIComponent(videoId) + '?rel=0&autoplay=1&modestbranding=1" ' +
+          'frameborder="0" ' +
+          'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" ' +
+          'allowfullscreen></iframe>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+  document.body.style.overflow = 'hidden';
+  document.addEventListener('keydown', _videoModalEsc);
+};
+
+window.closeVideoModal = function() {
+  var m = document.getElementById('ppt-video-modal');
+  if (m) m.remove();
+  document.body.style.overflow = '';
+  document.removeEventListener('keydown', _videoModalEsc);
+};
+
+function _videoModalEsc(e) {
+  if (e.key === 'Escape') closeVideoModal();
+}
 
 // =========== GATEWAYS (senha, expiração, domínio) ===========
 function checkSecurity() {
