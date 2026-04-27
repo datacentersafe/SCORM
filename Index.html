@@ -2840,17 +2840,38 @@ convertBtn.addEventListener('click', async () => {
 
     // Extrair TODAS as mídias do PPTX (preserva fidelidade)
     setProgress(58, 'Extraindo mídias…');
-    const mediaFiles = {};
+    const mediaFiles = {};       // safeName -> blob
+    const mediaNameMap = {};     // origName -> safeName (para reescrever referências em slidesData)
     const mediaKeys = Object.keys(pptxZip.files).filter(f => /^ppt\/media\//i.test(f));
     let imgCount = 0, audCount = 0, vidCount = 0;
     for (const key of mediaKeys) {
-      const fileName = key.split('/').pop();
-      mediaFiles[fileName] = await pptxZip.file(key).async('blob');
-      if (/\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(fileName)) imgCount++;
-      else if (/\.(mp3|wav|m4a|ogg|aac|wma)$/i.test(fileName)) audCount++;
-      else if (/\.(mp4|webm|mov|avi|wmv|m4v)$/i.test(fileName)) vidCount++;
+      const origName = key.split('/').pop();
+      // Sanitizar nome: remover acentos e caracteres especiais
+      const ext = (origName.match(/\.[a-z0-9]+$/i) || [''])[0].toLowerCase();
+      const base = origName.slice(0, origName.length - ext.length)
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^A-Za-z0-9_-]/g, '_').replace(/_+/g, '_');
+      let safeName = base + ext;
+      // Garantir unicidade
+      let counter = 1;
+      while (mediaFiles[safeName]) {
+        safeName = base + '_' + counter + ext;
+        counter++;
+      }
+      mediaFiles[safeName] = await pptxZip.file(key).async('blob');
+      mediaNameMap[origName] = safeName;
+      if (/\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(safeName)) imgCount++;
+      else if (/\.(mp3|wav|m4a|ogg|aac|wma)$/i.test(safeName)) audCount++;
+      else if (/\.(mp4|webm|mov|avi|wmv|m4v)$/i.test(safeName)) vidCount++;
     }
     log(`${imgCount} imagens, ${audCount} áudios, ${vidCount} vídeos extraídos`, 'ok');
+
+    // Reescrever as referências em slidesData usando os nomes sanitizados
+    slidesData.forEach(s => {
+      s.images = (s.images || []).map(n => mediaNameMap[n] || n);
+      s.audios = (s.audios || []).map(n => mediaNameMap[n] || n);
+      s.videos = (s.videos || []).map(n => mediaNameMap[n] || n);
+    });
 
     // Construir o pacote SCORM
     setProgress(70, 'Construindo pacote SCORM…');
@@ -2874,6 +2895,11 @@ convertBtn.addEventListener('click', async () => {
     // Manifest
     if (scormVersion === '1.2') {
       scormZip.file('imsmanifest.xml', buildManifestSCORM12(courseId, courseTitle, advConfig, mediaFiles));
+      // Adicionar XSDs (compatibilidade com Moodle e LMSs estritos)
+      log('Adicionando schemas XSD do SCORM 1.2…', 'info');
+      Object.keys(SCORM_12_XSDS).forEach(xsdName => {
+        scormZip.file(xsdName, SCORM_12_XSDS[xsdName]);
+      });
     } else {
       scormZip.file('imsmanifest.xml', buildManifestSCORM2004(courseId, courseTitle, advConfig, mediaFiles));
     }
@@ -2927,6 +2953,191 @@ function extractTextFromSlideXML(xml) {
 }
 
 // ====== TEMPLATES =====
+
+// XSDs SCORM 1.2 - obrigatórios em LMS estritos como Moodle do Tonoff
+const SCORM_12_XSDS = {
+  'imscp_rootv1p1p2.xsd': `<?xml version="1.0"?>
+<xsd:schema xmlns="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+            targetNamespace="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+            xmlns:xml="http://www.w3.org/XML/1998/namespace"
+            xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            elementFormDefault="unqualified" version="IMS CP 1.1.2">
+  <xsd:import namespace="http://www.w3.org/XML/1998/namespace" schemaLocation="ims_xml.xsd"/>
+  <xsd:element name="manifest" type="manifestType"/>
+  <xsd:element name="organizations" type="organizationsType"/>
+  <xsd:element name="organization" type="organizationType"/>
+  <xsd:element name="resources" type="resourcesType"/>
+  <xsd:element name="resource" type="resourceType"/>
+  <xsd:element name="dependency" type="dependencyType"/>
+  <xsd:element name="file" type="fileType"/>
+  <xsd:element name="metadata" type="metadataType"/>
+  <xsd:element name="schema" type="xsd:string"/>
+  <xsd:element name="schemaversion" type="xsd:string"/>
+  <xsd:element name="item" type="itemType"/>
+  <xsd:element name="title" type="xsd:string"/>
+  <xsd:complexType name="manifestType">
+    <xsd:sequence>
+      <xsd:element ref="metadata" minOccurs="0"/>
+      <xsd:element ref="organizations"/>
+      <xsd:element ref="resources"/>
+      <xsd:element ref="manifest" minOccurs="0" maxOccurs="unbounded"/>
+      <xsd:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute name="identifier" type="xsd:ID" use="required"/>
+    <xsd:attribute name="version" type="xsd:string"/>
+    <xsd:attribute ref="xml:base"/>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+  <xsd:complexType name="organizationsType">
+    <xsd:sequence>
+      <xsd:element ref="organization" minOccurs="0" maxOccurs="unbounded"/>
+      <xsd:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute name="default" type="xsd:IDREF"/>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+  <xsd:complexType name="organizationType">
+    <xsd:sequence>
+      <xsd:element ref="title" minOccurs="0"/>
+      <xsd:element ref="item" minOccurs="0" maxOccurs="unbounded"/>
+      <xsd:element ref="metadata" minOccurs="0"/>
+      <xsd:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute name="identifier" type="xsd:ID" use="required"/>
+    <xsd:attribute name="structure" type="xsd:string" default="hierarchical"/>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+  <xsd:complexType name="itemType">
+    <xsd:sequence>
+      <xsd:element ref="title" minOccurs="0"/>
+      <xsd:element ref="item" minOccurs="0" maxOccurs="unbounded"/>
+      <xsd:element ref="metadata" minOccurs="0"/>
+      <xsd:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute name="identifier" type="xsd:ID" use="required"/>
+    <xsd:attribute name="identifierref" type="xsd:string"/>
+    <xsd:attribute name="isvisible" type="xsd:boolean"/>
+    <xsd:attribute name="parameters" type="xsd:string"/>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+  <xsd:complexType name="resourcesType">
+    <xsd:sequence>
+      <xsd:element ref="resource" minOccurs="0" maxOccurs="unbounded"/>
+      <xsd:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute ref="xml:base"/>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+  <xsd:complexType name="resourceType">
+    <xsd:sequence>
+      <xsd:element ref="metadata" minOccurs="0"/>
+      <xsd:element ref="file" minOccurs="0" maxOccurs="unbounded"/>
+      <xsd:element ref="dependency" minOccurs="0" maxOccurs="unbounded"/>
+      <xsd:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute name="identifier" type="xsd:ID" use="required"/>
+    <xsd:attribute name="type" type="xsd:string" use="required"/>
+    <xsd:attribute name="href" type="xsd:string"/>
+    <xsd:attribute ref="xml:base"/>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+  <xsd:complexType name="fileType">
+    <xsd:sequence>
+      <xsd:element ref="metadata" minOccurs="0"/>
+      <xsd:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:attribute name="href" type="xsd:string" use="required"/>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+  <xsd:complexType name="dependencyType">
+    <xsd:attribute name="identifierref" type="xsd:string" use="required"/>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+  <xsd:complexType name="metadataType">
+    <xsd:sequence>
+      <xsd:element ref="schema" minOccurs="0"/>
+      <xsd:element ref="schemaversion" minOccurs="0"/>
+      <xsd:any namespace="##other" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+    </xsd:sequence>
+    <xsd:anyAttribute namespace="##other" processContents="lax"/>
+  </xsd:complexType>
+</xsd:schema>`,
+
+  'adlcp_rootv1p2.xsd': `<?xml version="1.0"?>
+<xsd:schema xmlns="http://www.adlnet.org/xsd/adlcp_rootv1p2"
+            targetNamespace="http://www.adlnet.org/xsd/adlcp_rootv1p2"
+            xmlns:xml="http://www.w3.org/XML/1998/namespace"
+            xmlns:imscp="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+            xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            elementFormDefault="unqualified" version="ADL Version 1.2">
+  <xsd:import namespace="http://www.imsproject.org/xsd/imscp_rootv1p1p2" schemaLocation="imscp_rootv1p1p2.xsd"/>
+  <xsd:element name="location" type="locationType"/>
+  <xsd:element name="prerequisites" type="prerequisitesType"/>
+  <xsd:element name="maxtimeallowed" type="maxtimeallowedType"/>
+  <xsd:element name="timelimitaction" type="timelimitactionType"/>
+  <xsd:element name="datafromlms" type="datafromlmsType"/>
+  <xsd:element name="masteryscore" type="masteryscoreType"/>
+  <xsd:attribute name="scormtype">
+    <xsd:simpleType>
+      <xsd:restriction base="xsd:string">
+        <xsd:enumeration value="asset"/>
+        <xsd:enumeration value="sco"/>
+      </xsd:restriction>
+    </xsd:simpleType>
+  </xsd:attribute>
+  <xsd:simpleType name="locationType"><xsd:restriction base="xsd:string"><xsd:maxLength value="2000"/></xsd:restriction></xsd:simpleType>
+  <xsd:complexType name="prerequisitesType">
+    <xsd:simpleContent>
+      <xsd:extension base="xsd:string">
+        <xsd:attribute name="type" use="required">
+          <xsd:simpleType><xsd:restriction base="xsd:string"><xsd:enumeration value="aicc_script"/></xsd:restriction></xsd:simpleType>
+        </xsd:attribute>
+      </xsd:extension>
+    </xsd:simpleContent>
+  </xsd:complexType>
+  <xsd:simpleType name="maxtimeallowedType"><xsd:restriction base="xsd:string"><xsd:maxLength value="13"/></xsd:restriction></xsd:simpleType>
+  <xsd:simpleType name="timelimitactionType">
+    <xsd:restriction base="xsd:string">
+      <xsd:enumeration value="exit,no message"/>
+      <xsd:enumeration value="exit,message"/>
+      <xsd:enumeration value="continue,no message"/>
+      <xsd:enumeration value="continue,message"/>
+    </xsd:restriction>
+  </xsd:simpleType>
+  <xsd:simpleType name="datafromlmsType"><xsd:restriction base="xsd:string"><xsd:maxLength value="255"/></xsd:restriction></xsd:simpleType>
+  <xsd:simpleType name="masteryscoreType"><xsd:restriction base="xsd:string"><xsd:maxLength value="200"/></xsd:restriction></xsd:simpleType>
+</xsd:schema>`,
+
+  'imsmd_rootv1p2p1.xsd': `<?xml version="1.0"?>
+<xsd:schema xmlns="http://www.imsglobal.org/xsd/imsmd_rootv1p2p1"
+            targetNamespace="http://www.imsglobal.org/xsd/imsmd_rootv1p2p1"
+            xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+            elementFormDefault="unqualified" version="IMS MD 1.2.1">
+  <xsd:element name="lom">
+    <xsd:complexType>
+      <xsd:sequence>
+        <xsd:any namespace="##any" processContents="lax" minOccurs="0" maxOccurs="unbounded"/>
+      </xsd:sequence>
+      <xsd:anyAttribute namespace="##any" processContents="lax"/>
+    </xsd:complexType>
+  </xsd:element>
+</xsd:schema>`,
+
+  'ims_xml.xsd': `<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://www.w3.org/XML/1998/namespace">
+  <xs:attribute name="lang" type="xs:language"/>
+  <xs:attribute name="space">
+    <xs:simpleType>
+      <xs:restriction base="xs:NCName">
+        <xs:enumeration value="default"/>
+        <xs:enumeration value="preserve"/>
+      </xs:restriction>
+    </xs:simpleType>
+  </xs:attribute>
+  <xs:attribute name="base" type="xs:anyURI"/>
+</xs:schema>`
+};
 
 const SCORM_API_JS = `
 /* SCORM 1.2 / 2004 API wrapper */
@@ -4042,11 +4253,9 @@ function buildPlayerHTML(title, slidesData, rule, cfg, adv) {
 </html>`;
 }
 function buildManifestSCORM12(courseId, title, adv, mediaFiles) {
-  const safeId = escapeXML(courseId);
+  const safeId = sanitizeScormId(courseId);
   const safeTitle = escapeXML(title);
   const passScore = adv && adv.tracking ? adv.tracking.passScore : 70;
-  const masteryNorm = (passScore / 100).toFixed(2);
-  const maxAttempts = adv && adv.tracking ? adv.tracking.maxAttempts : 0;
 
   // Listar mídias no manifesto
   let mediaFileTags = '';
@@ -4056,14 +4265,12 @@ function buildManifestSCORM12(courseId, title, adv, mediaFiles) {
     });
   }
 
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <manifest identifier="${safeId}_MANIFEST" version="1.0"
   xmlns="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
   xmlns:adlcp="http://www.adlnet.org/xsd/adlcp_rootv1p2"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xsi:schemaLocation="http://www.imsproject.org/xsd/imscp_rootv1p1p2 imscp_rootv1p1p2.xsd
-                      http://www.imsglobal.org/xsd/imsmd_rootv1p2p1 imsmd_rootv1p2p1.xsd
-                      http://www.adlnet.org/xsd/adlcp_rootv1p2 adlcp_rootv1p2.xsd">
+  xsi:schemaLocation="http://www.imsproject.org/xsd/imscp_rootv1p1p2 imscp_rootv1p1p2.xsd http://www.imsglobal.org/xsd/imsmd_rootv1p2p1 imsmd_rootv1p2p1.xsd http://www.adlnet.org/xsd/adlcp_rootv1p2 adlcp_rootv1p2.xsd">
   <metadata>
     <schema>ADL SCORM</schema>
     <schemaversion>1.2</schemaversion>
@@ -4073,7 +4280,7 @@ function buildManifestSCORM12(courseId, title, adv, mediaFiles) {
       <title>${safeTitle}</title>
       <item identifier="ITEM-${safeId}" identifierref="RES-${safeId}">
         <title>${safeTitle}</title>
-        <adlcp:masteryscore>${passScore}</adlcp:masteryscore>${maxAttempts > 0 ? `\n        <adlcp:maxtimeallowed>PT0H0M0S</adlcp:maxtimeallowed>` : ''}
+        <adlcp:masteryscore>${passScore}</adlcp:masteryscore>
       </item>
     </organization>
   </organizations>
@@ -4082,14 +4289,18 @@ function buildManifestSCORM12(courseId, title, adv, mediaFiles) {
       <file href="index.html"/>
       <file href="player.css"/>
       <file href="player.js"/>
-      <file href="scorm-api.js"/>${mediaFileTags}
+      <file href="scorm-api.js"/>
+      <file href="imscp_rootv1p1p2.xsd"/>
+      <file href="adlcp_rootv1p2.xsd"/>
+      <file href="imsmd_rootv1p2p1.xsd"/>
+      <file href="ims_xml.xsd"/>${mediaFileTags}
     </resource>
   </resources>
 </manifest>`;
 }
 
 function buildManifestSCORM2004(courseId, title, adv, mediaFiles) {
-  const safeId = escapeXML(courseId);
+  const safeId = sanitizeScormId(courseId);
   const safeTitle = escapeXML(title);
   const passScore = adv && adv.tracking ? adv.tracking.passScore : 70;
   const masteryNorm = (passScore / 100).toFixed(4);
@@ -4100,19 +4311,14 @@ function buildManifestSCORM2004(courseId, title, adv, mediaFiles) {
       mediaFileTags += `\n      <file href="media/${escapeXML(name)}"/>`;
     });
   }
-  return `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8" standalone="no"?>
 <manifest identifier="${safeId}_MANIFEST" version="1.0"
   xmlns="http://www.imsglobal.org/xsd/imscp_v1p1"
   xmlns:adlcp="http://www.adlnet.org/xsd/adlcp_v1p3"
   xmlns:adlseq="http://www.adlnet.org/xsd/adlseq_v1p3"
   xmlns:adlnav="http://www.adlnet.org/xsd/adlnav_v1p3"
   xmlns:imsss="http://www.imsglobal.org/xsd/imsss"
-  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-  xsi:schemaLocation="http://www.imsglobal.org/xsd/imscp_v1p1 imscp_v1p1.xsd
-                      http://www.adlnet.org/xsd/adlcp_v1p3 adlcp_v1p3.xsd
-                      http://www.adlnet.org/xsd/adlseq_v1p3 adlseq_v1p3.xsd
-                      http://www.adlnet.org/xsd/adlnav_v1p3 adlnav_v1p3.xsd
-                      http://www.imsglobal.org/xsd/imsss imsss_v1p0.xsd">
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <metadata>
     <schema>ADL SCORM</schema>
     <schemaversion>2004 3rd Edition</schemaversion>
@@ -4142,6 +4348,18 @@ function buildManifestSCORM2004(courseId, title, adv, mediaFiles) {
     </resource>
   </resources>
 </manifest>`;
+}
+
+function sanitizeScormId(s) {
+  // SCORM identifier: deve começar com letra, conter apenas [A-Za-z0-9_-]
+  // Acentos, espaços e caracteres especiais quebram parsers estritos como Apache+Moodle
+  let id = String(s || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // remove acentos
+    .replace(/[^A-Za-z0-9_-]/g, '_')                   // só permite letras, números, _ e -
+    .replace(/_+/g, '_')                                // colapsa multiple underscores
+    .replace(/^[^A-Za-z]+/, '');                        // garante começo com letra
+  if (!id) id = 'COURSE_' + Date.now().toString(36).toUpperCase();
+  return id;
 }
 
 function escapeXML(s) {
